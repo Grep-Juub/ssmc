@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# Function to display the help menu
+function show_help() {
+    echo "Usage: ssmc [INSTANCE_ID] [OPTIONS]"
+    echo
+    echo "Options:"
+    echo "  -h, --help                         Display this help menu."
+    echo "  -f, --port-forward LOCAL_PORT:REMOTE_PORT"
+    echo "                                     Start a port forwarding session for the given instance."
+    echo "                                     Specify local and remote ports in the format LOCAL:REMOTE."
+    echo
+    echo "Examples:"
+    echo "  ssmc                                # Select instance interactively"
+    echo "  ssmc i-0123456789abcdef0             # Start a session with the given instance ID"
+    echo "  ssmc -f 8080:80                      # Start port forwarding session interactively"
+    echo "  ssmc i-0123456789abcdef0 -f 8080:80  # Start port forwarding on specified instance"
+}
+
+CACHE_FILE="/tmp/aws_instance_cache.txt"
+CACHE_DURATION=10  # Cache duration in seconds
+
+function aws_instance_list() {
+    # Check if AWS credentials are set
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+        echo "Error: No AWS profile is set or AWS CLI is not configured properly. Please configure AWS CLI using 'aws configure'."
+        exit 1
+    fi
+
+    # Use cache if available and not expired
+    if [[ -f "$CACHE_FILE" && $(($(date +%s) - $(date +%s -r "$CACHE_FILE"))) -lt $CACHE_DURATION ]]; then
+        INSTANCE_INFO=$(cat "$CACHE_FILE")
+    else
+        # Fetch and display a list of running instances with their Instance ID, Name, and Private IPv4
+        INSTANCE_INFO=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" \
+            --query 'Reservations[*].Instances[*].[InstanceId, PrivateIpAddress, Tags[?Key==`Name`].Value | [0]]' \
+            --output text | awk '{ printf "%-20s %-15s %-30s\n", $1, $2, $3 }')
+        
+        # Cache the instance information
+        echo "$INSTANCE_INFO" > "$CACHE_FILE"
+    fi
+
+    # Use fzf to select an instance
+    SELECTED_INSTANCE=$(echo "$INSTANCE_INFO" | fzf --layout=reverse --height=40% --border --header='Select an instance (ID - Private IP - Name):' | awk '{print $1}')
+
+    # If no instance was selected, exit
+    if [ -z "$SELECTED_INSTANCE" ]; then
+        echo "No instance selected. Exiting."
+        exit 1
+    fi
+
+    echo "$SELECTED_INSTANCE"
+}
+
+# Main function for handling session connection
+function _ssmc() {
+    # Display help if -h or --help is passed
+    if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+        show_help
+        return
+    fi
+
+    # Check if the first argument is provided and if it's a valid instance ID
+    if [[ -n "$1" && "$1" =~ ^i-[a-z0-9]{17}$ ]]; then
+        INSTANCE_ID=$1
+        shift
+    else
+        INSTANCE_ID=$(aws_instance_list)
+    fi
+
+    # Handle port forwarding option
+    if [[ "$1" == "--port-forward" || "$1" == "-f" ]]; then
+        if [[ -n "$2" && "$2" =~ ^[0-9]+:[0-9]+$ ]]; then
+            IFS=":" read -r LOCAL_PORT REMOTE_PORT <<< "$2"
+            echo "Starting port forwarding from local port $LOCAL_PORT to remote port $REMOTE_PORT on instance $INSTANCE_ID..."
+            aws ssm start-session --target "$INSTANCE_ID" --document-name AWS-StartPortForwardingSession \
+                --parameters "{\"portNumber\":[\"$REMOTE_PORT\"],\"localPortNumber\":[\"$LOCAL_PORT\"]}"
+        else
+            echo "Error: Invalid port mapping. Please provide in the format LOCAL_PORT:REMOTE_PORT."
+            echo "Use -h or --help for usage information."
+            return
+        fi
+    elif [[ -n "$1" ]]; then
+        echo "Error: Unrecognized option '$1'."
+        echo "Use -h or --help for usage information."
+        return
+    else
+        echo "Starting an SSM session with instance $INSTANCE_ID..."
+        aws ssm start-session --target "$INSTANCE_ID"
+    fi
+}
+
+# Run the function
+_ssmc "$@"
+
